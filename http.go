@@ -1,4 +1,4 @@
-// Copyright (C) 2025 Mattia Cabrini
+// Copyright (C) 2025-2026 Mattia Cabrini
 // SPDX-License-Identifier: MIT
 
 package goapi
@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path"
 	"syscall"
 	"time"
 
@@ -15,14 +16,14 @@ import (
 )
 
 func startSession(w http.ResponseWriter, r *http.Request) (s *Session, b bool, err error) {
-	c, err := r.Cookie("sessionid")
-
-	if err == http.ErrNoCookie {
-		s, err = newSession("")
-		b = true
-	} else {
-		s, err = newSession(c.Value)
+	var id string
+	if c, cerr := r.Cookie("sessionid"); cerr == nil {
+		id = c.Value
 	}
+
+	// b reports a freshly minted session: no cookie, or a cookie whose session is
+	// unknown or expired. Such requests are treated like a first-time visitor.
+	s, b, err = newSession(id)
 
 	if s != nil {
 		http.SetCookie(w, s.GetCookie())
@@ -109,30 +110,54 @@ func handleDist(dist string, uri URI, w http.ResponseWriter, r *http.Request) {
 	err := handleFile(dist, &uri, w, r)
 
 	if err != nil {
-		utility.Logf(utility.INFO, "not found `%s`"+uri.path)
-		http.NotFound(w, r)
+		// SPA fallback: a path with no file extension is a client-side route, not
+		// an asset, so serve the SPA shell and let the router resolve it. Paths
+		// that look like assets (have an extension) still 404 so broken
+		// script/style URLs are not masked by index.html.
+		served := false
+		if path.Ext(uri.path) == "" {
+			served = serveSPAIndex(dist, w, r) == nil
+		}
+
+		if !served {
+			utility.Logf(utility.INFO, "not found `%s`", uri.path)
+			http.NotFound(w, r)
+		}
 	}
 }
 
+// serveSPAIndex serves dist/index.html (the SPA shell). It returns an error
+// without writing a response when index.html does not exist, so the caller can
+// fall back to a 404.
+func serveSPAIndex(dist string, w http.ResponseWriter, r *http.Request) (err error) {
+	index := dist + "/index.html"
+
+	if _, err = os.Stat(index); err == nil {
+		http.ServeFile(w, r, index)
+	}
+
+	return
+}
+
 func handleFile(filePath string, uri *URI, w http.ResponseWriter, r *http.Request) (err error) {
-	var s os.FileInfo
 	var part = ""
 
 	if uri != nil {
 		part = uri.Pop()
 	}
 
-	err = os.ErrNotExist
-
-	// depth first
 	if part != "" {
+		// Depth first: descend into the next path component. A miss deeper in the
+		// tree propagates rather than being masked by this directory's
+		// index.html, so genuinely missing assets can still 404 (the SPA fallback
+		// in handleDist decides what to do with the miss).
 		err = handleFile(filePath+"/"+part, uri, w, r)
-	}
+	} else {
+		// Leaf of the descent: serve the file, or fall back to the directory's
+		// own index.html for a bare directory request.
+		var s os.FileInfo
 
-	if err != nil {
-		s, err = os.Stat(filePath)
-
-		if err == nil {
+		if s, err = os.Stat(filePath); err == nil {
 			if s.IsDir() {
 				err = handleFile(filePath+"/"+"index.html", nil, w, r)
 			} else {
@@ -141,7 +166,7 @@ func handleFile(filePath string, uri *URI, w http.ResponseWriter, r *http.Reques
 		}
 	}
 
-	return err
+	return
 }
 
 func getHandler(controller interface{}, dist string) func(http.ResponseWriter, *http.Request) {
@@ -211,6 +236,8 @@ func Run(rootController interface{}, dist string, bind string, cert string, key 
 	if err := RestoreSessions(sessionDumpPath); err != nil {
 		utility.Logf(utility.ERROR, "could not restore sessions: %s", err.Error())
 	}
+
+	go sessionReaper()
 
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM) // -syscall.SIGHUP

@@ -1,4 +1,4 @@
-// Copyright (C) 2025 Mattia Cabrini
+// Copyright (C) 2025-2026 Mattia Cabrini
 // SPDX-License-Identifier: MIT
 
 package goapi
@@ -13,6 +13,15 @@ import (
 	"github.com/mattia-cabrini/go-utility"
 )
 
+// SessionTTL is the idle lifetime of a session. After this much inactivity a
+// session is destroyed server-side; it is also used for the cookie's expiry so
+// the client and server agree on the window.
+const SessionTTL = 15 * time.Minute
+
+// sessionReapInterval is how often the background reaper sweeps activeSessions
+// for idle sessions to destroy.
+const sessionReapInterval = 1 * time.Minute
+
 var activeSessionsLock = &sync.RWMutex{}
 var activeSessions = make(map[string]*Session)
 
@@ -25,37 +34,78 @@ type Session struct {
 	data      map[string]interface{}
 }
 
-func newSession(id string) (s *Session, err error) {
+// newSession returns the session for id, creating a fresh one when id is empty,
+// unknown, or references a session that has expired (idle longer than
+// SessionTTL). created reports whether a brand-new session was minted, which the
+// caller uses to treat expired/unknown cookies like a first-time visitor.
+func newSession(id string) (s *Session, created bool, err error) {
 	defer utility.Monitor(activeSessionsLock)()
 
-	var b = false
+	// Reuse an existing, still-valid session; destroy it on access if expired.
+	if id != "" {
+		if existing, ok := activeSessions[id]; ok {
+			unlock := utility.Monitor(existing.innerLock)
+			if time.Since(existing.lastOp) <= SessionTTL {
+				existing.lastOp = time.Now()
+				s = existing
+			} else {
+				delete(activeSessions, id) // expired -> destroy and recreate fresh
+			}
+			unlock()
+		}
+	}
 
-	if id == "" {
-		for id, err = utility.RandString(24); err == nil; id, err = utility.RandString(24) {
-			_, b := activeSessions[id]
-			if !b { // not duplicated session id
-				break
+	// Mint a fresh session when there is no valid one to reuse.
+	if s == nil {
+		// Generate a non-colliding id when none was supplied.
+		if id == "" {
+			for id, err = utility.RandString(24); err == nil; id, err = utility.RandString(24) {
+				if _, ok := activeSessions[id]; !ok { // not a duplicated session id
+					break
+				}
 			}
 		}
-	}
 
-	if err != nil {
-		err = utility.AppendError(err)
-		return
-	}
-
-	if s, b = activeSessions[id]; !b {
-		s = &Session{
-			id:        id,
-			innerLock: &sync.RWMutex{},
-			data:      make(map[string]interface{}),
+		if err != nil {
+			err = utility.AppendError(err)
+		} else {
+			s = &Session{
+				id:        id,
+				innerLock: &sync.RWMutex{},
+				data:      make(map[string]interface{}),
+				lastOp:    time.Now(),
+			}
+			activeSessions[id] = s
+			created = true
 		}
-		activeSessions[id] = s
 	}
-
-	s.lastOp = time.Now()
 
 	return
+}
+
+// reapSessions destroys every session that has been idle longer than SessionTTL.
+// Deleting map entries during a range is safe in Go.
+func reapSessions() {
+	defer utility.Monitor(activeSessionsLock)()
+
+	for id, sx := range activeSessions {
+		unlock := utility.RMonitor(sx.innerLock)
+		expired := time.Since(sx.lastOp) > SessionTTL
+		unlock()
+
+		if expired {
+			delete(activeSessions, id)
+		}
+	}
+}
+
+// sessionReaper periodically reaps idle sessions. It is meant to run in its own
+// goroutine for the lifetime of the process.
+func sessionReaper() {
+	for {
+		time.Sleep(sessionReapInterval)
+		reapSessions()
+	}
 }
 
 func (s *Session) User() string {
@@ -96,7 +146,7 @@ func (s *Session) GetCookie() *http.Cookie {
 		Name:     "sessionid",
 		Value:    s.id,
 		Secure:   true,
-		Expires:  time.Now().Add(15 * time.Minute),
+		Expires:  time.Now().Add(SessionTTL),
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
 		Path:     "/",
