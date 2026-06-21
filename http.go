@@ -95,8 +95,9 @@ func handleRequest(m *utility.Method, request string, hasAuth bool, w http.Respo
 	var ok bool
 
 	if resp, ok = respi.(Response); !ok {
-		resp := InitJsonResponse()
-		resp.Set("data", respi)
+		jr := InitJsonResponse()
+		jr.Set("data", respi)
+		resp = jr
 	}
 
 	resp.Write(w)

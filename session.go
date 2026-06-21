@@ -64,12 +64,12 @@ func (s *Session) User() string {
 }
 
 func (s *Session) SetUser(usr string) {
-	defer utility.RMonitor(s.innerLock)()
+	defer utility.Monitor(s.innerLock)()
 	s.userName = usr
 }
 
 func (s *Session) Get(key string) (v interface{}) {
-	defer utility.RMonitor(s.innerLock)()
+	defer utility.Monitor(s.innerLock)()
 	s.lastOp = time.Now()
 	v, b := s.data[key]
 
@@ -87,7 +87,7 @@ func (s *Session) Set(key string, v interface{}) {
 }
 
 func (s *Session) Delete() {
-	defer utility.Monitor(s.innerLock)()
+	defer utility.Monitor(activeSessionsLock)()
 	delete(activeSessions, s.id)
 }
 
@@ -111,10 +111,19 @@ func SessionDump(path string) error {
 	for _, sx := range activeSessions {
 		var mx = make(map[string]interface{})
 
+		// Read per-session state under its own lock and copy the data map,
+		// otherwise the JSON encoder may iterate sx.data while a request
+		// handler mutates it via Session.Set (concurrent map iteration/write).
+		unlock := utility.RMonitor(sx.innerLock)
+		dataCopy := make(map[string]interface{}, len(sx.data))
+		for k, v := range sx.data {
+			dataCopy[k] = v
+		}
 		mx["id"] = sx.id
-		mx["data"] = sx.data
+		mx["data"] = dataCopy
 		mx["lastOp"] = sx.lastOp
 		mx["userName"] = sx.userName
+		unlock()
 
 		m[sx.id] = mx
 	}
