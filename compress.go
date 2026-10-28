@@ -4,131 +4,80 @@
 package goapi
 
 import (
-	"compress/flate"
+	"bytes"
 	"compress/gzip"
+	"compress/zlib"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
 )
 
-// acceptedEncoding picks the content coding to use for r: "gzip" when the
-// client accepts it, otherwise "deflate", otherwise "". Range requests are never
-// compressed since byte ranges refer to the uncompressed representation.
-func acceptedEncoding(r *http.Request) (best string) {
-	if r.Header.Get("Range") != "" {
-		return
+// The content codings served and accepted, all from the standard library:
+// codings in the order preferred where a client weighs them alike; encoders
+// write a body in each, decoders read one sent in each. HTTP's "deflate" is
+// the zlib format (RFC 9110 §8.4.1.1), not a raw DEFLATE stream.
+var (
+	codings  = []string{"gzip", "deflate"}
+	encoders = map[string]func(io.Writer) io.WriteCloser{
+		"gzip":    func(w io.Writer) io.WriteCloser { return gzip.NewWriter(w) },
+		"deflate": func(w io.Writer) io.WriteCloser { return zlib.NewWriter(w) },
 	}
-
-	for _, part := range strings.Split(r.Header.Get("Accept-Encoding"), ",") {
-		name, params, _ := strings.Cut(strings.TrimSpace(part), ";")
-		name = strings.ToLower(strings.TrimSpace(name))
-
-		if name != "gzip" && name != "deflate" {
-			continue
-		}
-
-		if q, ok := strings.CutPrefix(strings.TrimSpace(params), "q="); ok {
-			if f, err := strconv.ParseFloat(q, 64); err == nil && f == 0 {
-				continue // explicitly refused
-			}
-		}
-
-		if name == "gzip" {
-			return name
-		}
-
-		best = name
+	decoders = map[string]func(io.Reader) (io.ReadCloser, error){
+		"gzip":    func(r io.Reader) (io.ReadCloser, error) { return gzip.NewReader(r) },
+		"deflate": zlib.NewReader,
 	}
+)
 
-	return
+// encoded returns body written in coding.
+func encoded(coding string, body []byte) []byte {
+	var b bytes.Buffer
+	w := encoders[coding](&b)
+	w.Write(body)
+	w.Close()
+	return b.Bytes()
 }
 
-// compressWriter compresses the response body with the negotiated encoding.
-// The status line is deferred to the first body write so bodyless responses
-// (redirects, 204, 304) go out untouched and a Content-Length set by the
-// handler (e.g. http.ServeFile) can be dropped before the headers are sent.
-type compressWriter struct {
-	http.ResponseWriter
-	encoding    string
-	status      int
-	wroteHeader bool
-	cw          io.WriteCloser
-}
-
-func (c *compressWriter) WriteHeader(code int) {
-	if c.status == 0 {
-		c.status = code
-	}
-}
-
-func (c *compressWriter) Write(p []byte) (int, error) {
-	if !c.wroteHeader {
-		// Sniff before compressing, as net/http would otherwise sniff the compressed bytes.
-		if h := c.Header(); h.Get("Content-Type") == "" {
-			h.Set("Content-Type", http.DetectContentType(p))
-		}
-		c.flushHeader(true)
+// codingOf returns the coding the answer to r may go in: of codings, the one
+// its Accept-Encoding weighs most with a weight above zero, the first on a
+// tie; "" where it takes none of them, and for a HEAD, which has no body.
+func codingOf(r *http.Request) string {
+	if r.Method == http.MethodHead {
+		return ""
 	}
 
-	if c.cw != nil {
-		return c.cw.Write(p)
+	weights := map[string]float64{}
+
+	for _, item := range strings.Split(r.Header.Get("Accept-Encoding"), ",") {
+		coding, params, _ := strings.Cut(item, ";")
+		weights[strings.ToLower(strings.TrimSpace(coding))] = weightOf(params)
 	}
 
-	return c.ResponseWriter.Write(p)
-}
+	best, top := "", 0.0
 
-func (c *compressWriter) flushHeader(body bool) {
-	c.wroteHeader = true
-
-	if c.status == 0 {
-		c.status = http.StatusOK
-	}
-
-	h := c.Header()
-
-	if body && h.Get("Content-Encoding") == "" && c.status >= 200 && c.status != http.StatusNoContent && c.status != http.StatusNotModified {
-		h.Del("Content-Length")
-		h.Set("Content-Encoding", c.encoding)
-
-		if c.encoding == "gzip" {
-			c.cw = gzip.NewWriter(c.ResponseWriter)
-		} else {
-			c.cw, _ = flate.NewWriter(c.ResponseWriter, flate.DefaultCompression)
+	for _, c := range codings {
+		if weights[c] > top {
+			best, top = c, weights[c]
 		}
 	}
 
-	c.ResponseWriter.WriteHeader(c.status)
+	return best
 }
 
-// Close sends the deferred headers if nothing was written and finishes the
-// compressed stream.
-func (c *compressWriter) Close() {
-	if !c.wroteHeader {
-		c.flushHeader(false)
+// weightOf returns the weight an Accept-Encoding item gives its coding: its
+// q, 1 where it gives none, 0 where it is not a number.
+func weightOf(params string) float64 {
+	q, weighed := strings.CutPrefix(strings.TrimSpace(params), "q=")
+
+	if !weighed {
+		return 1
 	}
 
-	if c.cw != nil {
-		c.cw.Close()
+	w, err := strconv.ParseFloat(q, 64)
+
+	if err != nil {
+		return 0
 	}
-}
 
-// compress wraps next so its response body is gzip- or deflate-encoded when
-// the client advertises support via Accept-Encoding.
-func compress(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Add("Vary", "Accept-Encoding")
-
-		enc := acceptedEncoding(r)
-
-		if enc == "" {
-			next(w, r)
-			return
-		}
-
-		cw := &compressWriter{ResponseWriter: w, encoding: enc}
-		defer cw.Close()
-
-		next(cw, r)
-	}
+	return w
 }

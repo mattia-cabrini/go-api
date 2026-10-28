@@ -4,6 +4,8 @@
 package goapi
 
 import (
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -130,4 +132,46 @@ func TestSessionConcurrency(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+func TestSessionDumpRoundTrip(t *testing.T) {
+	resetSessions(t)
+	path := filepath.Join(t.TempDir(), "sessions.json")
+
+	s, _, _ := newSession("")
+	s.SetUser("alice")
+	s.Set("k", "v")
+	s.innerLock.Lock()
+	s.host, s.userAgent = "10.0.0.7:4242", "TestAgent/1.0"
+	s.innerLock.Unlock()
+
+	if err := SessionDump(path); err != nil {
+		t.Fatalf("SessionDump: %v", err)
+	}
+
+	resetSessions(t)
+	if err := RestoreSessions(path); err != nil {
+		t.Fatalf("RestoreSessions: %v", err)
+	}
+
+	r, created, _ := newSession(s.id)
+	if created || r.User() != "alice" || r.Get("k") != "v" || r.host != "10.0.0.7:4242" || r.userAgent != "TestAgent/1.0" {
+		t.Errorf("restored session differs: created=%v user=%q k=%v host=%q ua=%q", created, r.User(), r.Get("k"), r.host, r.userAgent)
+	}
+}
+
+func TestRestoreSessionsOldDumpFormat(t *testing.T) {
+	resetSessions(t)
+	path := filepath.Join(t.TempDir(), "sessions.json")
+	old := `{"abc":{"id":"abc","data":{"k":1},"lastOp":"` + time.Now().Format(time.RFC3339Nano) + `","userName":"bob"}}`
+	os.WriteFile(path, []byte(old), 0o600)
+
+	if err := RestoreSessions(path); err != nil {
+		t.Fatalf("RestoreSessions: %v", err)
+	}
+	r, created, _ := newSession("abc")
+	if created || r.User() != "bob" || r.Get("k") != 1.0 {
+		t.Errorf("old dump not restored: created=%v user=%q", created, r.User())
+	}
+	r.Set("x", 1) // a dump with "data": null must still yield a usable map
 }

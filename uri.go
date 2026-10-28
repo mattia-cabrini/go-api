@@ -5,6 +5,8 @@ package goapi
 
 import "strings"
 
+// URI is a request path split in its components, read as a stack: Pop yields
+// them from the first, StackCount tells how many are left.
 type URI struct {
 	comp []string
 	path string
@@ -13,7 +15,7 @@ type URI struct {
 }
 
 func InitURI(uri string) (u URI) {
-	u.path = strings.Split(uri, "?")[0]
+	u.path, _, _ = strings.Cut(uri, "?")
 	u.comp = strings.Split(u.path, "/")[1:]
 	return
 }
@@ -29,8 +31,4 @@ func (u *URI) Pop() (part string) {
 
 func (u *URI) StackCount() int {
 	return len(u.comp) - u.stackIx
-}
-
-func (u *URI) ResetStack() {
-	u.stackIx = 0
 }

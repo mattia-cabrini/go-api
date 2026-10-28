@@ -56,30 +56,23 @@ type JsonResponse struct {
 	data map[string]interface{}
 }
 
-// InitJsonResponse creates a JsonResponse with default "session": true and JSON content-type.
-func InitJsonResponse() JsonResponse {
-	br := newBaseResponse()
-	jr := JsonResponse{
-		BaseResponse: br,
-		data:         make(map[string]interface{}),
-	}
-	jr.data["session"] = true
-	jr.data["errors"] = []string{}
-	jr.SetHeader("Content-Type", "application/json")
-	return jr
+// InitJsonResponse creates a JsonResponse with default "session": true, an
+// empty "errors" list and JSON content-type.
+func InitJsonResponse() (jr JsonResponse) {
+	jr.ensure()
+	return
 }
 
-// ensure initializes BaseResponse, data map and default fields if they are not yet initialized.
+// ensure initializes BaseResponse, data map and default fields if they are not
+// yet initialized, so a zero JsonResponse behaves like InitJsonResponse's.
 func (jr *JsonResponse) ensure() {
 	if jr.BaseResponse == nil {
 		jr.BaseResponse = newBaseResponse()
 	}
 	if jr.data == nil {
-		jr.data = make(map[string]interface{})
-		jr.data["session"] = true
+		jr.data = map[string]interface{}{"session": true}
 		jr.SetHeader("Content-Type", "application/json")
 	}
-	// ensure errors slice exists
 	if _, ok := jr.data["errors"]; !ok {
 		jr.data["errors"] = []string{}
 	}
@@ -93,17 +86,15 @@ func (jr *JsonResponse) Set(key string, value interface{}) {
 
 // SetSession sets the "session" field to true or false.
 func (jr *JsonResponse) SetSession(valid bool) {
-	jr.ensure()
-	jr.data["session"] = valid
+	jr.Set("session", valid)
 }
 
-// If err != nil append error and set status to Internal Server Error
-// Otherwise do nothing
+// AppendError500 appends err and sets status Internal Server Error; a nil err
+// does nothing.
 func (jr *JsonResponse) AppendError500(err error) {
 	if err != nil {
-		jr.ensure()
+		jr.AppendError(err)
 		jr.SetStatus(http.StatusInternalServerError)
-		jr.AppendErrorStr(err.Error())
 	}
 }
 
@@ -112,12 +103,10 @@ func (jr *JsonResponse) AppendError(err error) {
 	jr.AppendErrorStr(err.Error())
 }
 
-// AppendError adds an error message to the errors slice in the JSON body.
+// AppendErrorStr adds an error message to the errors slice in the JSON body.
 func (jr *JsonResponse) AppendErrorStr(err string) {
 	jr.ensure()
-	existing := jr.data["errors"].([]string)
-	existing = append(existing, err)
-	jr.data["errors"] = existing
+	jr.data["errors"] = append(jr.data["errors"].([]string), err)
 }
 
 // Write serializes the JSON body and writes it to the ResponseWriter.

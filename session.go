@@ -38,6 +38,16 @@ type Session struct {
 	data      map[string]interface{}
 }
 
+// sessionRecord is a Session as written in the session dump.
+type sessionRecord struct {
+	ID        string                 `json:"id"`
+	Data      map[string]interface{} `json:"data"`
+	LastOp    time.Time              `json:"lastOp"`
+	UserName  string                 `json:"userName"`
+	Host      string                 `json:"host"`
+	UserAgent string                 `json:"userAgent"`
+}
+
 // newSession returns the session for id, creating a fresh one when id is empty,
 // unknown, or references a session that has expired (idle longer than
 // SessionTTL). created reports whether a brand-new session was minted, which the
@@ -45,48 +55,54 @@ type Session struct {
 func newSession(id string) (s *Session, created bool, err error) {
 	defer utility.Monitor(activeSessionsLock)()
 
-	// Reuse an existing, still-valid session; destroy it on access if expired.
-	if id != "" {
-		if existing, ok := activeSessions[id]; ok {
-			unlock := utility.Monitor(existing.innerLock)
-			if time.Since(existing.lastOp) <= SessionTTL {
-				existing.lastOp = time.Now()
-				existing.logEvent("modified")
-				s = existing
-			} else {
-				existing.logEvent("destroyed")
-				delete(activeSessions, id) // expired -> destroy and recreate fresh
-			}
-			unlock()
+	if existing, ok := activeSessions[id]; ok {
+		if existing.alive() {
+			existing.touch()
+			return existing, false, nil
+		}
+
+		destroy(existing) // expired: destroy and recreate fresh
+	}
+
+	// Generate a non-colliding id when none was supplied.
+	for id == "" || activeSessions[id] != nil {
+		if id, err = utility.RandString(24); err != nil {
+			return nil, false, utility.AppendError(err)
 		}
 	}
 
-	// Mint a fresh session when there is no valid one to reuse.
-	if s == nil {
-		// Generate a non-colliding id when none was supplied.
-		if id == "" {
-			for id, err = utility.RandString(24); err == nil; id, err = utility.RandString(24) {
-				if _, ok := activeSessions[id]; !ok { // not a duplicated session id
-					break
-				}
-			}
-		}
-
-		if err != nil {
-			err = utility.AppendError(err)
-		} else {
-			s = &Session{
-				id:        id,
-				innerLock: &sync.RWMutex{},
-				data:      make(map[string]interface{}),
-				lastOp:    time.Now(),
-			}
-			activeSessions[id] = s
-			created = true
-		}
+	s = &Session{
+		id:        id,
+		innerLock: &sync.RWMutex{},
+		data:      make(map[string]interface{}),
+		lastOp:    time.Now(),
 	}
+	activeSessions[id] = s
 
-	return
+	return s, true, nil
+}
+
+// alive reports whether the session was used within SessionTTL.
+func (s *Session) alive() bool {
+	defer utility.RMonitor(s.innerLock)()
+	return time.Since(s.lastOp) <= SessionTTL
+}
+
+// touch records a use of the session.
+func (s *Session) touch() {
+	defer utility.Monitor(s.innerLock)()
+	s.lastOp = time.Now()
+	s.logEvent("modified")
+}
+
+// destroy removes s from activeSessions. The caller must hold
+// activeSessionsLock.
+func destroy(s *Session) {
+	unlock := utility.RMonitor(s.innerLock)
+	s.logEvent("destroyed")
+	unlock()
+
+	delete(activeSessions, s.id)
 }
 
 // logEvent writes a VERBOSE line describing the session's origin. The token is
@@ -102,26 +118,10 @@ func (s *Session) logEvent(event string) {
 func reapSessions() {
 	defer utility.Monitor(activeSessionsLock)()
 
-	for id, sx := range activeSessions {
-		unlock := utility.RMonitor(sx.innerLock)
-		expired := time.Since(sx.lastOp) > SessionTTL
-		if expired {
-			sx.logEvent("destroyed")
+	for _, sx := range activeSessions {
+		if !sx.alive() {
+			destroy(sx)
 		}
-		unlock()
-
-		if expired {
-			delete(activeSessions, id)
-		}
-	}
-}
-
-// sessionReaper periodically reaps idle sessions. It is meant to run in its own
-// goroutine for the lifetime of the process.
-func sessionReaper() {
-	for {
-		time.Sleep(sessionReapInterval)
-		reapSessions()
 	}
 }
 
@@ -138,16 +138,10 @@ func (s *Session) SetUser(usr string) {
 	}
 }
 
-func (s *Session) Get(key string) (v interface{}) {
+func (s *Session) Get(key string) interface{} {
 	defer utility.Monitor(s.innerLock)()
 	s.lastOp = time.Now()
-	v, b := s.data[key]
-
-	if !b {
-		v = nil
-	}
-
-	return v
+	return s.data[key]
 }
 
 func (s *Session) Set(key string, v interface{}) {
@@ -158,10 +152,7 @@ func (s *Session) Set(key string, v interface{}) {
 
 func (s *Session) Delete() {
 	defer utility.Monitor(activeSessionsLock)()
-	unlock := utility.RMonitor(s.innerLock)
-	s.logEvent("destroyed")
-	unlock()
-	delete(activeSessions, s.id)
+	destroy(s)
 }
 
 func (s *Session) GetCookie() *http.Cookie {
@@ -176,75 +167,80 @@ func (s *Session) GetCookie() *http.Cookie {
 	}
 }
 
+// record is a snapshot of the session for the dump. The data map is copied,
+// otherwise the JSON encoder may iterate it while a request handler mutates it
+// via Session.Set (concurrent map iteration/write).
+func (s *Session) record() sessionRecord {
+	defer utility.RMonitor(s.innerLock)()
+
+	data := make(map[string]interface{}, len(s.data))
+	for k, v := range s.data {
+		data[k] = v
+	}
+
+	return sessionRecord{ID: s.id, Data: data, LastOp: s.lastOp, UserName: s.userName, Host: s.host, UserAgent: s.userAgent}
+}
+
+// SessionDump writes every active session to path as JSON.
 func SessionDump(path string) error {
 	defer utility.Monitor(activeSessionsLock)()
 
-	var m = make(map[string]interface{})
-
-	for _, sx := range activeSessions {
-		var mx = make(map[string]interface{})
-
-		// Read per-session state under its own lock and copy the data map,
-		// otherwise the JSON encoder may iterate sx.data while a request
-		// handler mutates it via Session.Set (concurrent map iteration/write).
-		unlock := utility.RMonitor(sx.innerLock)
-		dataCopy := make(map[string]interface{}, len(sx.data))
-		for k, v := range sx.data {
-			dataCopy[k] = v
-		}
-		mx["id"] = sx.id
-		mx["data"] = dataCopy
-		mx["lastOp"] = sx.lastOp
-		mx["userName"] = sx.userName
-		mx["host"] = sx.host
-		mx["userAgent"] = sx.userAgent
-		unlock()
-
-		m[sx.id] = mx
+	records := make(map[string]sessionRecord, len(activeSessions))
+	for id, sx := range activeSessions {
+		records[id] = sx.record()
 	}
 
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 	if err == nil {
-		enc := json.NewEncoder(f)
-		err = enc.Encode(m)
+		defer f.Close()
+		err = json.NewEncoder(f).Encode(records)
 	}
 
 	return utility.AppendError(err)
 }
 
-func RestoreSessions(sessionDumpPath string) error {
-	defer utility.Monitor(activeSessionsLock)()
+// dumpSessions writes the session dump, logging a failure rather than
+// returning it.
+func dumpSessions(path string) {
+	if err := SessionDump(path); err != nil {
+		utility.Logf(utility.ERROR, "%v", err)
+	}
+}
 
-	if sessionDumpPath == "" {
+// RestoreSessions loads the sessions SessionDump wrote to path, if any.
+func RestoreSessions(path string) error {
+	if path == "" {
 		return nil
 	}
 
-	var m = make(map[string]interface{})
+	defer utility.Monitor(activeSessionsLock)()
 
-	f, err := os.OpenFile(sessionDumpPath, os.O_RDONLY, 0600)
-	if err == nil {
-		dec := json.NewDecoder(f)
-		dec.Decode(&m)
+	f, err := os.Open(path)
+	if err != nil {
+		return utility.AppendError(err)
+	}
+	defer f.Close()
 
-		for _, mxi := range m {
-			var mx = mxi.(map[string]interface{})
+	var records map[string]sessionRecord
+	if err = json.NewDecoder(f).Decode(&records); err != nil {
+		return utility.AppendError(err)
+	}
 
-			tm, _ := time.Parse(time.RFC3339Nano, mx["lastOp"].(string))
-			host, _ := mx["host"].(string)           // absent in dumps written
-			userAgent, _ := mx["userAgent"].(string) // before these fields existed
-			var sx = &Session{
-				id:        mx["id"].(string),
-				data:      mx["data"].(map[string]interface{}),
-				lastOp:    tm,
-				userName:  mx["userName"].(string),
-				host:      host,
-				userAgent: userAgent,
-				innerLock: &sync.RWMutex{},
-			}
+	for _, rec := range records {
+		if rec.Data == nil {
+			rec.Data = make(map[string]interface{})
+		}
 
-			activeSessions[sx.id] = sx
+		activeSessions[rec.ID] = &Session{
+			id:        rec.ID,
+			userName:  rec.UserName,
+			lastOp:    rec.LastOp,
+			host:      rec.Host,
+			userAgent: rec.UserAgent,
+			innerLock: &sync.RWMutex{},
+			data:      rec.Data,
 		}
 	}
 
-	return utility.AppendError(err)
+	return nil
 }

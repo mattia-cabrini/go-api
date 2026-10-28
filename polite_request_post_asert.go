@@ -4,7 +4,7 @@
 package goapi
 
 import (
-	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -25,6 +25,37 @@ const (
 	DATETIME   // yyyy-mm-dd hh:mm:ss
 )
 
+// check is how a PostFieldType validates a value: valid accepts it, want names
+// what was expected in the error otherwise.
+type check struct {
+	valid func(string) bool
+	want  string
+}
+
+func isInt(ok func(int) bool) func(string) bool {
+	return func(v string) bool { i, err := strconv.Atoi(v); return err == nil && ok(i) }
+}
+
+func isFloat(ok func(float64) bool) func(string) bool {
+	return func(v string) bool { f, err := strconv.ParseFloat(v, 64); return err == nil && ok(f) }
+}
+
+func isTime(layout string) func(string) bool {
+	return func(v string) bool { _, err := time.Parse(layout, v); return err == nil }
+}
+
+var checks = map[PostFieldType]check{
+	STRING:           {func(string) bool { return true }, ""},
+	INTEGER:          {isInt(func(int) bool { return true }), "integer"},
+	FLOAT:            {isFloat(func(float64) bool { return true }), "float"},
+	POSITIVE_INTEGER: {isInt(func(i int) bool { return i > 0 }), "positive integer"},
+	POSITIVE_FLOAT:   {isFloat(func(f float64) bool { return f > 0 }), "positive float"},
+	PERC_FLOAT:       {isFloat(func(f float64) bool { return f >= 0 && f <= 1 }), "percentage between 0 and 1"},
+	DATE:             {isTime("2006-01-02"), "date in yyyy-mm-dd format"},
+	TIME:             {isTime("15:04:05"), "time in hh:mm:ss format"},
+	DATETIME:         {isTime("2006-01-02 15:04:05"), "datetime in yyyy-mm-dd hh:mm:ss format"},
+}
+
 type PostParam struct {
 	Name     string        // parameter name
 	Type     PostFieldType // expected data type
@@ -37,62 +68,29 @@ type PostAssert struct {
 }
 
 func InitPoliteRequestPostInterface(pr PoliteRequest) *PostAssert {
-	return &PostAssert{pr: pr, params: make([]PostParam, 0)}
+	return &PostAssert{pr: pr}
 }
 
 func (pa *PostAssert) AddParameter(name string, typ PostFieldType, required bool) {
 	pa.params = append(pa.params, PostParam{Name: name, Type: typ, Required: required})
 }
 
+// Assert validates every parameter added against the form, returning the
+// errors found and whether there were none.
 func (pa *PostAssert) Assert() ([]error, bool) {
 	errs := make([]error, 0)
+
 	for _, p := range pa.params {
 		val := strings.TrimSpace(pa.pr.PostFormValue(p.Name))
 
-		// Check presence
 		if val == "" {
 			if p.Required {
-				errs = append(errs, errors.New("parameter '"+p.Name+"' is required"))
+				errs = append(errs, fmt.Errorf("parameter '%s' is required", p.Name))
 			}
-			continue
-		}
-
-		switch p.Type {
-		case STRING:
-			// always valid
-		case INTEGER:
-			if _, err := strconv.Atoi(val); err != nil {
-				errs = append(errs, errors.New("parameter '"+p.Name+"': expected integer"))
-			}
-		case FLOAT:
-			if _, err := strconv.ParseFloat(val, 64); err != nil {
-				errs = append(errs, errors.New("parameter '"+p.Name+"': expected float"))
-			}
-		case POSITIVE_INTEGER:
-			if i, err := strconv.Atoi(val); err != nil || i <= 0 {
-				errs = append(errs, errors.New("parameter '"+p.Name+"': expected positive integer"))
-			}
-		case POSITIVE_FLOAT:
-			if f, err := strconv.ParseFloat(val, 64); err != nil || f <= 0 {
-				errs = append(errs, errors.New("parameter '"+p.Name+"': expected positive float"))
-			}
-		case PERC_FLOAT:
-			if f, err := strconv.ParseFloat(val, 64); err != nil || f < 0 || f > 1 {
-				errs = append(errs, errors.New("parameter '"+p.Name+"': expected percentage between 0 and 1"))
-			}
-		case DATE:
-			if _, err := time.Parse("2006-01-02", val); err != nil {
-				errs = append(errs, errors.New("parameter '"+p.Name+"': expected date in yyyy-mm-dd format"))
-			}
-		case TIME:
-			if _, err := time.Parse("15:04:05", val); err != nil {
-				errs = append(errs, errors.New("parameter '"+p.Name+"': expected time in hh:mm:ss format"))
-			}
-		case DATETIME:
-			if _, err := time.Parse("2006-01-02 15:04:05", val); err != nil {
-				errs = append(errs, errors.New("parameter '"+p.Name+"': expected datetime in yyyy-mm-dd hh:mm:ss format"))
-			}
+		} else if c, known := checks[p.Type]; known && !c.valid(val) {
+			errs = append(errs, fmt.Errorf("parameter '%s': expected %s", p.Name, c.want))
 		}
 	}
+
 	return errs, len(errs) == 0
 }

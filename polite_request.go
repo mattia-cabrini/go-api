@@ -4,7 +4,6 @@
 package goapi
 
 import (
-	"bytes"
 	"encoding/json"
 	"io"
 	"mime/multipart"
@@ -23,6 +22,17 @@ func initPoliteRequest(r *http.Request) PoliteRequest {
 	return PoliteRequest{Request: r}
 }
 
+// firstValues keeps the first value of each key of a multi-valued form.
+func firstValues(form map[string][]string) map[string]string {
+	m := make(map[string]string, len(form))
+	for k, v := range form {
+		if len(v) > 0 {
+			m[k] = v[0]
+		}
+	}
+	return m
+}
+
 // GetCookie retrieves the value of the cookie with the specified name.
 // Returns an error if the cookie does not exist or cannot be accessed.
 func (pr *PoliteRequest) GetCookie(name string) (string, error) {
@@ -36,13 +46,7 @@ func (pr *PoliteRequest) GetCookie(name string) (string, error) {
 // QueryParams returns the URL query parameters as a map[string]string.
 // Only the first value for each key is retained.
 func (pr *PoliteRequest) QueryParams() map[string]string {
-	m := make(map[string]string)
-	for k, v := range pr.URL.Query() {
-		if len(v) > 0 {
-			m[k] = v[0]
-		}
-	}
-	return m
+	return firstValues(pr.URL.Query())
 }
 
 // FormParams parses and returns HTML form POST parameters as a map[string]string.
@@ -51,13 +55,7 @@ func (pr *PoliteRequest) FormParams() (map[string]string, error) {
 	if err := pr.ParseForm(); err != nil {
 		return nil, err
 	}
-	m := make(map[string]string)
-	for k, v := range pr.PostForm {
-		if len(v) > 0 {
-			m[k] = v[0]
-		}
-	}
-	return m, nil
+	return firstValues(pr.PostForm), nil
 }
 
 // JSONParams parses a JSON POST body (e.g., from an Axios request) and
@@ -65,8 +63,7 @@ func (pr *PoliteRequest) FormParams() (map[string]string, error) {
 func (pr *PoliteRequest) JSONParams() (map[string]interface{}, error) {
 	var m map[string]interface{}
 	defer pr.Body.Close()
-	decoder := json.NewDecoder(pr.Body)
-	if err := decoder.Decode(&m); err != nil && err != io.EOF {
+	if err := json.NewDecoder(pr.Body).Decode(&m); err != nil && err != io.EOF {
 		return nil, err
 	}
 	return m, nil
@@ -76,40 +73,28 @@ func (pr *PoliteRequest) JSONParams() (map[string]interface{}, error) {
 // - fields: map[string]string of form field values
 // - files: map[string][]*multipart.FileHeader of uploaded files
 // maxMemory indicates the maximum amount of memory to use for parsing.
-func (pr *PoliteRequest) MultipartParams(maxMemory int64) (_ map[string]string, _ map[string][]*multipart.FileHeader, terror error) {
+func (pr *PoliteRequest) MultipartParams(maxMemory int64) (map[string]string, map[string][]*multipart.FileHeader, error) {
 	if err := pr.ParseMultipartForm(maxMemory); err != nil {
 		return nil, nil, err
 	}
-	fields := make(map[string]string)
-	for k, v := range pr.MultipartForm.Value {
-		if len(v) > 0 {
-			fields[k] = v[0]
-		}
-	}
-	files := make(map[string][]*multipart.FileHeader)
-	for k, fhs := range pr.MultipartForm.File {
-		files[k] = fhs
-	}
-	return fields, files, nil
+	return firstValues(pr.MultipartForm.Value), pr.MultipartForm.File, nil
 }
 
+// RetrieveMultipartFileBytes returns the content and header of the uploaded
+// file under key, parsing the form with at most 10 MiB in memory.
 func (pr PoliteRequest) RetrieveMultipartFileBytes(key string) (buf []byte, h *multipart.FileHeader, err error) {
-	const maxUploadSize = 10 << 20 // 10 MB
-	var buffer bytes.Buffer
-	var fp multipart.File
+	const maxUploadSize = 10 << 20
 
-	err = pr.ParseMultipartForm(maxUploadSize)
-	if err == nil {
-
-		fp, h, err = pr.FormFile(key)
-		if err == nil {
-
-			defer utility.Deferrable(fp.Close, nil, nil)
-			_, err = io.Copy(&buffer, fp)
-		}
+	if err = pr.ParseMultipartForm(maxUploadSize); err != nil {
+		return nil, nil, utility.AppendError(err)
 	}
 
-	buf = buffer.Bytes()
-	err = utility.AppendError(err)
-	return
+	fp, h, err := pr.FormFile(key)
+	if err != nil {
+		return nil, nil, utility.AppendError(err)
+	}
+	defer fp.Close()
+
+	buf, err = io.ReadAll(fp)
+	return buf, h, utility.AppendError(err)
 }
