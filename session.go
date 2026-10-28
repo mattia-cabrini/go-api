@@ -4,6 +4,8 @@
 package goapi
 
 import (
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"os"
@@ -26,9 +28,11 @@ var activeSessionsLock = &sync.RWMutex{}
 var activeSessions = make(map[string]*Session)
 
 type Session struct {
-	id       string
-	userName string
-	lastOp   time.Time
+	id        string
+	userName  string
+	lastOp    time.Time
+	host      string // remote address the session was created from
+	userAgent string // User-Agent of the request that created the session
 
 	innerLock *sync.RWMutex
 	data      map[string]interface{}
@@ -47,8 +51,10 @@ func newSession(id string) (s *Session, created bool, err error) {
 			unlock := utility.Monitor(existing.innerLock)
 			if time.Since(existing.lastOp) <= SessionTTL {
 				existing.lastOp = time.Now()
+				existing.logEvent("modified")
 				s = existing
 			} else {
+				existing.logEvent("destroyed")
 				delete(activeSessions, id) // expired -> destroy and recreate fresh
 			}
 			unlock()
@@ -83,6 +89,14 @@ func newSession(id string) (s *Session, created bool, err error) {
 	return
 }
 
+// logEvent writes a VERBOSE line describing the session's origin. The token is
+// logged as its SHA-1 digest: still unique per session, but unusable to hijack
+// it from the logs. The caller must hold s.innerLock (read or write).
+func (s *Session) logEvent(event string) {
+	digest := sha1.Sum([]byte(s.id))
+	utility.Logf(utility.VERBOSE, "session %s %s for %s@%s using %s", hex.EncodeToString(digest[:]), event, s.userName, s.host, s.userAgent)
+}
+
 // reapSessions destroys every session that has been idle longer than SessionTTL.
 // Deleting map entries during a range is safe in Go.
 func reapSessions() {
@@ -91,6 +105,9 @@ func reapSessions() {
 	for id, sx := range activeSessions {
 		unlock := utility.RMonitor(sx.innerLock)
 		expired := time.Since(sx.lastOp) > SessionTTL
+		if expired {
+			sx.logEvent("destroyed")
+		}
 		unlock()
 
 		if expired {
@@ -115,7 +132,10 @@ func (s *Session) User() string {
 
 func (s *Session) SetUser(usr string) {
 	defer utility.Monitor(s.innerLock)()
-	s.userName = usr
+	if s.userName != usr {
+		s.userName = usr
+		s.logEvent("modified")
+	}
 }
 
 func (s *Session) Get(key string) (v interface{}) {
@@ -138,6 +158,9 @@ func (s *Session) Set(key string, v interface{}) {
 
 func (s *Session) Delete() {
 	defer utility.Monitor(activeSessionsLock)()
+	unlock := utility.RMonitor(s.innerLock)
+	s.logEvent("destroyed")
+	unlock()
 	delete(activeSessions, s.id)
 }
 
@@ -173,6 +196,8 @@ func SessionDump(path string) error {
 		mx["data"] = dataCopy
 		mx["lastOp"] = sx.lastOp
 		mx["userName"] = sx.userName
+		mx["host"] = sx.host
+		mx["userAgent"] = sx.userAgent
 		unlock()
 
 		m[sx.id] = mx
@@ -205,11 +230,15 @@ func RestoreSessions(sessionDumpPath string) error {
 			var mx = mxi.(map[string]interface{})
 
 			tm, _ := time.Parse(time.RFC3339Nano, mx["lastOp"].(string))
+			host, _ := mx["host"].(string)           // absent in dumps written
+			userAgent, _ := mx["userAgent"].(string) // before these fields existed
 			var sx = &Session{
 				id:        mx["id"].(string),
 				data:      mx["data"].(map[string]interface{}),
 				lastOp:    tm,
 				userName:  mx["userName"].(string),
+				host:      host,
+				userAgent: userAgent,
 				innerLock: &sync.RWMutex{},
 			}
 

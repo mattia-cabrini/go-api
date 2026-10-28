@@ -1,4 +1,4 @@
-// Copyright (C) 2025 Mattia Cabrini
+// Copyright (C) 2025-2026 Mattia Cabrini
 // SPDX-License-Identifier: MIT
 
 package goapi

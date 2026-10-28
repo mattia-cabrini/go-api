@@ -27,6 +27,13 @@ func startSession(w http.ResponseWriter, r *http.Request) (s *Session, b bool, e
 
 	if s != nil {
 		http.SetCookie(w, s.GetCookie())
+
+		if b {
+			unlock := utility.Monitor(s.innerLock)
+			s.host, s.userAgent = r.RemoteAddr, r.UserAgent()
+			s.logEvent("created")
+			unlock()
+		}
 	}
 
 	return
@@ -231,7 +238,7 @@ func safeExit(sessionDumpPath string) {
 }
 
 func Run(rootController interface{}, dist string, bind string, cert string, key string, sessionDumpPath string) {
-	http.HandleFunc("/", getHandler(rootController, dist))
+	http.HandleFunc("/", compress(getHandler(rootController, dist)))
 
 	if err := RestoreSessions(sessionDumpPath); err != nil {
 		utility.Logf(utility.ERROR, "could not restore sessions: %s", err.Error())
