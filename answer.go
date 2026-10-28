@@ -206,17 +206,23 @@ func (a *answerWriter) WriteHeader(code int) {
 
 	a.shell = a.rebased && file && code == http.StatusOK && strings.HasPrefix(h.Get("Content-Type"), "text/html")
 
-	// Every body is compressed unless that would break it: a partial body
-	// (ranges refer to the uncompressed bytes), one already encoded, or an
-	// answer that has no body at all.
-	whole := code >= 200 && code != http.StatusNoContent && code != http.StatusNotModified && code != http.StatusPartialContent
-	compressible := whole && h.Get("Content-Encoding") == ""
+	// Every answer but a partial one (ranges refer to the bytes as written)
+	// varies with Accept-Encoding, even with no body: a 304 must carry the
+	// Vary its 200 would (RFC 9110 §15.4.5), so caches keep the compressed
+	// and the plain copies apart. A body already encoded, by the handler or
+	// the file cache, goes as it is, and is not range-able.
+	partial := code == http.StatusPartialContent
+	whole := code >= 200 && code != http.StatusNoContent && code != http.StatusNotModified && !partial
 
-	if compressible {
+	if !partial {
 		h.Add("Vary", "Accept-Encoding")
 	}
 
-	a.pack = compressible && a.coding != ""
+	if h.Get("Content-Encoding") != "" {
+		h.Del("Accept-Ranges")
+	}
+
+	a.pack = whole && h.Get("Content-Encoding") == "" && a.coding != ""
 
 	if a.shell || a.pack {
 		a.held = &bytes.Buffer{}
@@ -342,10 +348,15 @@ func (a *answerWriter) finish() {
 	}
 }
 
-// sentCoding is the coding the body went in, for the call log.
+// sentCoding is the coding the body went in, for the call log: the one this
+// writer applied, or the one the handler had already applied.
 func (a *answerWriter) sentCoding() string {
 	if a.packed {
 		return a.coding
+	}
+
+	if ce := a.Header().Get("Content-Encoding"); ce != "" {
+		return ce
 	}
 
 	return "identity"

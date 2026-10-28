@@ -27,6 +27,30 @@ func backdate(s *Session, d time.Duration) {
 	s.innerLock.Unlock()
 }
 
+func TestActiveSessionsCountsOnlyAlive(t *testing.T) {
+	resetSessions(t)
+
+	if n := ActiveSessions(); n != 0 {
+		t.Fatalf("empty registry: %d", n)
+	}
+
+	a, _, _ := newSession("")
+	newSession("")
+	if n := ActiveSessions(); n != 2 {
+		t.Fatalf("two fresh sessions: %d", n)
+	}
+
+	backdate(a, SessionTTL+time.Second)
+	if n := ActiveSessions(); n != 1 {
+		t.Errorf("one expired, not yet reaped: %d", n)
+	}
+
+	reapSessions()
+	if n := ActiveSessions(); n != 1 {
+		t.Errorf("after reaping: %d", n)
+	}
+}
+
 func TestNewSessionReuseWhenValid(t *testing.T) {
 	resetSessions(t)
 

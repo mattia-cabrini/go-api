@@ -117,7 +117,7 @@ func handleDist(dist string, uri URI, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	http.ServeFile(w, r, file)
+	cache.serve(w, r, file)
 }
 
 func getHandler(root interface{}, dist string) http.HandlerFunc {

@@ -125,6 +125,20 @@ func reapSessions() {
 	}
 }
 
+// ActiveSessions returns how many sessions are alive: used within SessionTTL,
+// whether or not the reaper has swept the expired ones yet.
+func ActiveSessions() (n int) {
+	defer utility.RMonitor(activeSessionsLock)()
+
+	for _, sx := range activeSessions {
+		if sx.alive() {
+			n++
+		}
+	}
+
+	return
+}
+
 func (s *Session) User() string {
 	defer utility.RMonitor(s.innerLock)()
 	return s.userName
