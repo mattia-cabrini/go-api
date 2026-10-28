@@ -98,3 +98,45 @@ func (pr PoliteRequest) RetrieveMultipartFileBytes(key string) (buf []byte, h *m
 	buf, err = io.ReadAll(fp)
 	return buf, h, utility.AppendError(err)
 }
+
+// Transform converts the parameters of a request, as the strings they arrive
+// in, to the values an API function expects, and may refuse them with an
+// error. It is the project's to define: which keys hold integers, amounts,
+// dates, and what a malformed one means.
+type Transform func(params map[string]string) (map[string]interface{}, error)
+
+// transform is the Transform SetTransform installed, nil for none. It is set
+// once at startup, before Run.
+var transform Transform
+
+// SetTransform installs the Transform that Convert, and so Params, apply.
+// With none installed, parameters pass through unchanged, as strings.
+func SetTransform(t Transform) {
+	transform = t
+}
+
+// Convert applies the installed Transform to params; with none, it returns
+// them as they are, as strings.
+func Convert(params map[string]string) (map[string]interface{}, error) {
+	if transform != nil {
+		return transform(params)
+	}
+
+	m := make(map[string]interface{}, len(params))
+	for k, v := range params {
+		m[k] = v
+	}
+
+	return m, nil
+}
+
+// Params returns the POST form parameters converted by the installed
+// Transform (see SetTransform), or as strings when there is none.
+func (pr PoliteRequest) Params() (map[string]interface{}, error) {
+	fields, err := pr.FormParams()
+	if err != nil {
+		return nil, err
+	}
+
+	return Convert(fields)
+}
